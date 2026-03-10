@@ -3,13 +3,24 @@ import {GitCommandManager} from './git-command-manager'
 import {Pull} from './pulls-helper'
 import {v4 as uuidv4} from 'uuid'
 
+const INCREMENTAL_PUSH_DELAY_MS = 5000
+
 export class RebaseHelper {
   private git: GitCommandManager
   private extraOptions: string[]
+  private incrementalPush: boolean
+  private dropEmptyCommits: boolean
 
-  constructor(git: GitCommandManager, options: string[]) {
+  constructor(
+    git: GitCommandManager,
+    options: string[],
+    incrementalPush = false,
+    dropEmptyCommits = false
+  ) {
     this.git = git
     this.extraOptions = options
+    this.incrementalPush = incrementalPush
+    this.dropEmptyCommits = dropEmptyCommits
   }
 
   async rebase(pull: Pull): Promise<boolean> {
@@ -52,19 +63,68 @@ export class RebaseHelper {
     core.endGroup()
 
     if (result == RebaseResult.Rebased) {
-      core.startGroup(`Pushing changes to head ref '${pull.headRef}'`)
-      await this.git.push([
-        '--force-with-lease',
-        remoteName,
-        `HEAD:${pull.headRef}`
-      ])
-      core.endGroup()
+      if (this.dropEmptyCommits) {
+        core.startGroup(`Dropping empty commits from '${pull.headRef}'.`)
+        await this.dropEmpty(`origin/${pull.baseRef}`)
+        core.endGroup()
+      }
+      if (this.incrementalPush) {
+        core.startGroup(
+          `Incrementally pushing commits to head ref '${pull.headRef}'`
+        )
+        const commitsOutput = await this.git.revList(
+          [`origin/${pull.baseRef}..HEAD`],
+          ['--reverse']
+        )
+        const commits = commitsOutput.split('\n').filter(c => c.length > 0)
+        for (let commitIndex = 0; commitIndex < commits.length; commitIndex++) {
+          await this.git.push([
+            '--force-with-lease',
+            remoteName,
+            `${commits[commitIndex]}:refs/heads/${pull.headRef}`
+          ])
+          if (commitIndex < commits.length - 1) {
+            await new Promise(resolve =>
+              setTimeout(resolve, INCREMENTAL_PUSH_DELAY_MS)
+            )
+          }
+        }
+        core.endGroup()
+      } else {
+        core.startGroup(`Pushing changes to head ref '${pull.headRef}'`)
+        await this.git.push([
+          '--force-with-lease',
+          remoteName,
+          `HEAD:${pull.headRef}`
+        ])
+        core.endGroup()
+      }
       core.info(`Head ref '${pull.headRef}' successfully rebased.`)
       return true
     } else if (result == RebaseResult.AlreadyUpToDate) {
       core.info(
         `Head ref '${pull.headRef}' is already up to date with the base.`
       )
+      if (this.dropEmptyCommits) {
+        core.startGroup(`Dropping empty commits from '${pull.headRef}'.`)
+        const headBefore = await this.git.revParse('HEAD')
+        await this.dropEmpty(`origin/${pull.baseRef}`)
+        const headAfter = await this.git.revParse('HEAD')
+        core.endGroup()
+        if (headBefore !== headAfter) {
+          core.startGroup(`Pushing changes to head ref '${pull.headRef}'`)
+          await this.git.push([
+            '--force-with-lease',
+            remoteName,
+            `HEAD:${pull.headRef}`
+          ])
+          core.endGroup()
+          core.info(
+            `Head ref '${pull.headRef}' updated after dropping empty commits.`
+          )
+          return true
+        }
+      }
     } else if (result == RebaseResult.Failed) {
       core.info(
         `Rebase of head ref '${pull.headRef}' failed. Conflicts must be resolved manually.`
@@ -93,9 +153,57 @@ export class RebaseHelper {
         ...this.extraOptions,
         `${remoteName}/${ref}`
       ])
-      return result ? RebaseResult.Rebased : RebaseResult.AlreadyUpToDate
+      return result.stdout.includes('is up to date') ||
+        result.stderr.includes('is up to date')
+        ? RebaseResult.AlreadyUpToDate
+        : RebaseResult.Rebased
     } catch {
       return RebaseResult.Failed
+    }
+  }
+
+  private async dropEmpty(baseRef: string): Promise<void> {
+    // Get all commits between base and HEAD
+    const revListOutput = await this.git.revList([`${baseRef}..HEAD`])
+    if (!revListOutput) return
+
+    const commits = revListOutput.split('\n').filter(s => s.length > 0)
+    const emptyCommits: string[] = []
+
+    for (const sha of commits) {
+      const tree = await this.git.revParse(`${sha}^{tree}`)
+      const parentTree = await this.git.revParse(`${sha}^^{tree}`)
+      if (tree === parentTree) {
+        core.info(`Found empty commit: ${sha}`)
+        emptyCommits.push(sha)
+      }
+    }
+
+    if (emptyCommits.length === 0) {
+      core.info('No empty commits found.')
+      return
+    }
+
+    // Build a sed command to drop the empty commits from the interactive
+    // rebase todo list
+    const sedParts = emptyCommits.map(sha => {
+      const short = sha.substring(0, 7)
+      return `-e 's/^pick ${short}/drop ${short}/'`
+    })
+    const sedCmd = "sed -i'' " + sedParts.join(' ')
+
+    // Use GIT_SEQUENCE_EDITOR to non-interactively drop empty commits
+    process.env['GIT_SEQUENCE_EDITOR'] = sedCmd
+    try {
+      await this.git.exec([
+        'rebase',
+        '-i',
+        '--force-rebase',
+        baseRef
+      ])
+      core.info(`Dropped ${emptyCommits.length} empty commit(s).`)
+    } finally {
+      delete process.env['GIT_SEQUENCE_EDITOR']
     }
   }
 }

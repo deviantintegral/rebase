@@ -400,7 +400,9 @@ function run() {
                 includeLabels: utils.getInputAsArray('include-labels'),
                 excludeLabels: utils.getInputAsArray('exclude-labels'),
                 excludeDrafts: core.getInput('exclude-drafts') === 'true',
-                rebaseOptions: utils.getInputAsArray('rebase-options')
+                rebaseOptions: utils.getInputAsArray('rebase-options'),
+                incrementalPush: core.getInput('incremental-push') === 'true',
+                dropEmptyCommits: core.getInput('drop-empty-commits') === 'true'
             };
             core.debug(`Inputs: ${(0, util_1.inspect)(inputs)}`);
             const [headOwner, head] = inputValidator.parseHead(inputs.head);
@@ -419,7 +421,7 @@ function run() {
                 // Rebase
                 // Create a git command manager
                 const git = yield git_command_manager_1.GitCommandManager.create(sourceSettings.repositoryPath);
-                const rebaseHelper = new rebase_helper_1.RebaseHelper(git, inputs.rebaseOptions);
+                const rebaseHelper = new rebase_helper_1.RebaseHelper(git, inputs.rebaseOptions, inputs.incrementalPush, inputs.dropEmptyCommits);
                 let rebasedCount = 0;
                 for (const pull of pulls) {
                     const result = yield rebaseHelper.rebase(pull);
@@ -625,10 +627,13 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.RebaseHelper = void 0;
 const core = __importStar(__nccwpck_require__(2186));
 const uuid_1 = __nccwpck_require__(5840);
+const INCREMENTAL_PUSH_DELAY_MS = 5000;
 class RebaseHelper {
-    constructor(git, options) {
+    constructor(git, options, incrementalPush = false, dropEmptyCommits = false) {
         this.git = git;
         this.extraOptions = options;
+        this.incrementalPush = incrementalPush;
+        this.dropEmptyCommits = dropEmptyCommits;
     }
     rebase(pull) {
         return __awaiter(this, void 0, void 0, function* () {
@@ -658,18 +663,59 @@ class RebaseHelper {
             const result = yield this.tryRebase('origin', pull.baseRef);
             core.endGroup();
             if (result == RebaseResult.Rebased) {
-                core.startGroup(`Pushing changes to head ref '${pull.headRef}'`);
-                yield this.git.push([
-                    '--force-with-lease',
-                    remoteName,
-                    `HEAD:${pull.headRef}`
-                ]);
-                core.endGroup();
+                if (this.dropEmptyCommits) {
+                    core.startGroup(`Dropping empty commits from '${pull.headRef}'.`);
+                    yield this.dropEmpty(`origin/${pull.baseRef}`);
+                    core.endGroup();
+                }
+                if (this.incrementalPush) {
+                    core.startGroup(`Incrementally pushing commits to head ref '${pull.headRef}'`);
+                    const commitsOutput = yield this.git.revList([`origin/${pull.baseRef}..HEAD`], ['--reverse']);
+                    const commits = commitsOutput.split('\n').filter(c => c.length > 0);
+                    for (let commitIndex = 0; commitIndex < commits.length; commitIndex++) {
+                        yield this.git.push([
+                            '--force-with-lease',
+                            remoteName,
+                            `${commits[commitIndex]}:refs/heads/${pull.headRef}`
+                        ]);
+                        if (commitIndex < commits.length - 1) {
+                            yield new Promise(resolve => setTimeout(resolve, INCREMENTAL_PUSH_DELAY_MS));
+                        }
+                    }
+                    core.endGroup();
+                }
+                else {
+                    core.startGroup(`Pushing changes to head ref '${pull.headRef}'`);
+                    yield this.git.push([
+                        '--force-with-lease',
+                        remoteName,
+                        `HEAD:${pull.headRef}`
+                    ]);
+                    core.endGroup();
+                }
                 core.info(`Head ref '${pull.headRef}' successfully rebased.`);
                 return true;
             }
             else if (result == RebaseResult.AlreadyUpToDate) {
                 core.info(`Head ref '${pull.headRef}' is already up to date with the base.`);
+                if (this.dropEmptyCommits) {
+                    core.startGroup(`Dropping empty commits from '${pull.headRef}'.`);
+                    const headBefore = yield this.git.revParse('HEAD');
+                    yield this.dropEmpty(`origin/${pull.baseRef}`);
+                    const headAfter = yield this.git.revParse('HEAD');
+                    core.endGroup();
+                    if (headBefore !== headAfter) {
+                        core.startGroup(`Pushing changes to head ref '${pull.headRef}'`);
+                        yield this.git.push([
+                            '--force-with-lease',
+                            remoteName,
+                            `HEAD:${pull.headRef}`
+                        ]);
+                        core.endGroup();
+                        core.info(`Head ref '${pull.headRef}' updated after dropping empty commits.`);
+                        return true;
+                    }
+                }
             }
             else if (result == RebaseResult.Failed) {
                 core.info(`Rebase of head ref '${pull.headRef}' failed. Conflicts must be resolved manually.`);
@@ -695,10 +741,56 @@ class RebaseHelper {
                     ...this.extraOptions,
                     `${remoteName}/${ref}`
                 ]);
-                return result ? RebaseResult.Rebased : RebaseResult.AlreadyUpToDate;
+                return result.stdout.includes('is up to date') ||
+                    result.stderr.includes('is up to date')
+                    ? RebaseResult.AlreadyUpToDate
+                    : RebaseResult.Rebased;
             }
             catch (_a) {
                 return RebaseResult.Failed;
+            }
+        });
+    }
+    dropEmpty(baseRef) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Get all commits between base and HEAD
+            const revListOutput = yield this.git.revList([`${baseRef}..HEAD`]);
+            if (!revListOutput)
+                return;
+            const commits = revListOutput.split('\n').filter(s => s.length > 0);
+            const emptyCommits = [];
+            for (const sha of commits) {
+                const tree = yield this.git.revParse(`${sha}^{tree}`);
+                const parentTree = yield this.git.revParse(`${sha}^^{tree}`);
+                if (tree === parentTree) {
+                    core.info(`Found empty commit: ${sha}`);
+                    emptyCommits.push(sha);
+                }
+            }
+            if (emptyCommits.length === 0) {
+                core.info('No empty commits found.');
+                return;
+            }
+            // Build a sed command to drop the empty commits from the interactive
+            // rebase todo list
+            const sedParts = emptyCommits.map(sha => {
+                const short = sha.substring(0, 7);
+                return `-e 's/^pick ${short}/drop ${short}/'`;
+            });
+            const sedCmd = "sed -i'' " + sedParts.join(' ');
+            // Use GIT_SEQUENCE_EDITOR to non-interactively drop empty commits
+            process.env['GIT_SEQUENCE_EDITOR'] = sedCmd;
+            try {
+                yield this.git.exec([
+                    'rebase',
+                    '-i',
+                    '--force-rebase',
+                    baseRef
+                ]);
+                core.info(`Dropped ${emptyCommits.length} empty commit(s).`);
+            }
+            finally {
+                delete process.env['GIT_SEQUENCE_EDITOR'];
             }
         });
     }
