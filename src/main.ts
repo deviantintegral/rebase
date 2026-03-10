@@ -21,7 +21,8 @@ async function run(): Promise<void> {
       excludeLabels: utils.getInputAsArray('exclude-labels'),
       excludeDrafts: core.getInput('exclude-drafts') === 'true',
       rebaseOptions: utils.getInputAsArray('rebase-options'),
-      incrementalPush: core.getInput('incremental-push') === 'true'
+      incrementalPush: core.getInput('incremental-push') === 'true',
+      dropEmptyCommits: core.getInput('drop-empty-commits') === 'true'
     }
     core.debug(`Inputs: ${inspect(inputs)}`)
 
@@ -56,7 +57,8 @@ async function run(): Promise<void> {
       const rebaseHelper = new RebaseHelper(
         git,
         inputs.rebaseOptions,
-        inputs.incrementalPush
+        inputs.incrementalPush,
+        inputs.dropEmptyCommits
       )
       let rebasedCount = 0
       for (const pull of pulls) {
